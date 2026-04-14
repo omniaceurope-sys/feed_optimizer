@@ -200,6 +200,38 @@ with col3:
 with col4:
     scrape_enabled = st.toggle("Scrape pages", value=True)
 
+# ── Column selection ─────────────────────────────────────────────────────────
+
+with st.expander("Columns to optimize", expanded=True):
+    st.caption("Uncheck any column you want to leave as-is. audit_flags is always generated.")
+
+    ccol1, ccol2, ccol3 = st.columns(3)
+    with ccol1:
+        opt_title       = st.checkbox("Title",                     value=True, key="col_title")
+        opt_description = st.checkbox("Description",               value=True, key="col_desc")
+        opt_ptype       = st.checkbox("Product type",              value=True, key="col_ptype")
+    with ccol2:
+        opt_label0      = st.checkbox("Label 0 — Price tier",      value=True, key="col_l0")
+        opt_label1      = st.checkbox("Label 1 — Product form",    value=True, key="col_l1")
+        opt_label2      = st.checkbox("Label 2 — Primary benefit", value=True, key="col_l2")
+    with ccol3:
+        opt_label3      = st.checkbox("Label 3 — Pack type",       value=True, key="col_l3")
+        opt_label4      = st.checkbox("Label 4 — Audience",        value=True, key="col_l4")
+
+selected_columns = [
+    col for col, enabled in [
+        ("optimized_title",        opt_title),
+        ("optimized_description",  opt_description),
+        ("product_type_suggested", opt_ptype),
+        ("custom_label_0",         opt_label0),
+        ("custom_label_1",         opt_label1),
+        ("custom_label_2",         opt_label2),
+        ("custom_label_3",         opt_label3),
+        ("custom_label_4",         opt_label4),
+    ]
+    if enabled
+]
+
 # ── Run button ───────────────────────────────────────────────────────────────
 
 run_clicked = st.button(
@@ -253,7 +285,7 @@ if run_clicked and uploaded_file:
         st.write(f"Calling Claude ({model})...")
         system_prompt = load_system_prompt()
         try:
-            raw_response = call_claude(csv_text, system_prompt, model, client, tracker)
+            raw_response = call_claude(csv_text, system_prompt, model, client, tracker, columns=selected_columns)
         except anthropic.APIStatusError as e:
             status.update(label="API error", state="error")
             st.error(f"Claude API error {e.status_code}: {e.message}")
@@ -270,7 +302,8 @@ if run_clicked and uploaded_file:
 
     csv_output, summary = extract_csv_and_summary(raw_response)
 
-    if not csv_output or "optimized_title" not in csv_output:
+    expected_col = selected_columns[0] if selected_columns else "audit_flags"
+    if not csv_output or expected_col not in csv_output:
         st.warning("Could not cleanly extract CSV from response. Showing raw output.")
         csv_output = raw_response
 

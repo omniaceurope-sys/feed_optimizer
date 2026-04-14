@@ -413,7 +413,30 @@ def call_claude(
     model: str,
     client: anthropic.Anthropic,
     tracker: "CostTracker",
+    columns: list[str] | None = None,
 ) -> str:
+    # Build column scope instruction
+    all_output_cols = [
+        "optimized_title",
+        "optimized_description",
+        "product_type_suggested",
+        "custom_label_0",
+        "custom_label_1",
+        "custom_label_2",
+        "custom_label_3",
+        "custom_label_4",
+    ]
+    if columns and set(columns) != set(all_output_cols):
+        active = [c for c in all_output_cols if c in columns]
+        skipped = [c for c in all_output_cols if c not in columns]
+        col_instruction = (
+            f"Generate ONLY these output columns: {', '.join(active)}. "
+            f"For the following columns output an empty string: {', '.join(skipped)}. "
+            "Always generate audit_flags regardless.\n\n"
+        )
+    else:
+        col_instruction = ""
+
     user_message = (
         "Here is the product feed CSV to optimize.\n\n"
         f"The `{BRIEF_COL}` column contains a structured brief extracted from each "
@@ -430,6 +453,7 @@ def call_claude(
         "`keyword_planner_unavailable` to `audit_flags`.\n\n"
         f"Do NOT include the `{BRIEF_COL}` or `{KEYWORD_ANGLES_COL}` columns in your output "
         "CSV — they are working columns only.\n\n"
+        + col_instruction +
         "Return the complete optimized CSV first, then the summary section.\n\n"
         f"```csv\n{csv_text}\n```"
     )
