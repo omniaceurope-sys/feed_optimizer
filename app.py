@@ -39,27 +39,79 @@ MODELS = [
 
 MARKETS = {
     "Global": "0",
-    "Poland": "2616",
+    # Western Europe
     "United Kingdom": "2826",
     "Germany": "2276",
-    "United States": "2840",
     "France": "2250",
+    "Italy": "2380",
+    "Spain": "2724",
     "Netherlands": "2528",
+    "Belgium": "2056",
+    "Austria": "2040",
+    "Switzerland": "2756",
+    "Portugal": "2620",
+    "Ireland": "2372",
+    "Luxembourg": "2442",
+    # Northern Europe
+    "Sweden": "2752",
+    "Norway": "2578",
+    "Denmark": "2208",
+    "Finland": "2246",
+    # Central & Eastern Europe
+    "Poland": "2616",
     "Czech Republic": "2203",
-    "Romania": "2642",
+    "Slovakia": "2703",
     "Hungary": "2348",
+    "Romania": "2642",
+    "Bulgaria": "2100",
+    "Croatia": "2191",
+    "Slovenia": "2705",
+    "Serbia": "2688",
+    "Ukraine": "2804",
+    # Baltic
+    "Estonia": "2233",
+    "Latvia": "2428",
+    "Lithuania": "2440",
+    # Southern Europe
+    "Greece": "2300",
+    "Cyprus": "2196",
+    "Malta": "2470",
+    # Other
+    "United States": "2840",
 }
 
 LANGUAGES = {
     "Auto-detect": "",
-    "Polish": "pl",
+    # Major
     "English": "en",
     "German": "de",
     "French": "fr",
+    "Italian": "it",
+    "Spanish": "es",
+    "Polish": "pl",
     "Dutch": "nl",
+    "Portuguese": "pt",
+    # Northern
+    "Swedish": "sv",
+    "Norwegian": "no",
+    "Danish": "da",
+    "Finnish": "fi",
+    # Central & Eastern
     "Czech": "cs",
-    "Romanian": "ro",
+    "Slovak": "sk",
     "Hungarian": "hu",
+    "Romanian": "ro",
+    "Bulgarian": "bg",
+    "Croatian": "hr",
+    "Slovenian": "sl",
+    "Serbian": "sr",
+    "Ukrainian": "uk",
+    # Baltic
+    "Estonian": "et",
+    "Latvian": "lv",
+    "Lithuanian": "lt",
+    # Southern
+    "Greek": "el",
 }
 
 
