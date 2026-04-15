@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +38,12 @@ load_dotenv()
 DEFAULT_MODEL = "claude-sonnet-4-6"
 BRIEF_MODEL = "claude-haiku-4-5-20251001"   # cheap model used only for brief extraction
 MAX_OUTPUT_TOKENS = 64000
+
+# Batching — rows per Claude call for large feeds
+BATCH_SIZE = 50
+# Retry — how many times to retry on 429, and base delay in seconds
+MAX_RETRIES = 6
+RETRY_BASE_DELAY = 60
 
 # Column name for the structured brief added to the CSV before sending to optimizer
 BRIEF_COL = "product_page_brief"
@@ -414,6 +421,7 @@ def call_claude(
     client: anthropic.Anthropic,
     tracker: "CostTracker",
     columns: list[str] | None = None,
+    extra_context: str = "",
 ) -> str:
     # Build column scope instruction
     all_output_cols = [
@@ -438,6 +446,7 @@ def call_claude(
         col_instruction = ""
 
     user_message = (
+        (f"{extra_context}\n\n" if extra_context else "") +
         "Here is the product feed CSV to optimize.\n\n"
         f"The `{BRIEF_COL}` column contains a structured brief extracted from each "
         "product's live page, with these fields: INGREDIENTS, CLAIMS, CERTIFICATIONS, "
@@ -459,12 +468,17 @@ def call_claude(
     )
 
     chunks: list[str] = []
+    # System prompt is passed as a content block so Anthropic can cache it across batch calls.
     with client.beta.messages.stream(
         model=model,
         max_tokens=MAX_OUTPUT_TOKENS,
-        system=system_prompt,
+        system=[{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }],
         messages=[{"role": "user", "content": user_message}],
-        betas=["output-128k-2025-02-19"],
+        betas=["output-128k-2025-02-19", "prompt-caching-2024-07-31"],
     ) as stream:
         for text in stream.text_stream:
             chunks.append(text)
@@ -472,6 +486,148 @@ def call_claude(
 
     tracker.record(model, final.usage.input_tokens, final.usage.output_tokens, label="optimizer")
     return "".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Retry wrapper
+# ---------------------------------------------------------------------------
+
+def call_claude_with_retry(
+    csv_text: str,
+    system_prompt: str,
+    model: str,
+    client: anthropic.Anthropic,
+    tracker: "CostTracker",
+    columns: list[str] | None = None,
+    extra_context: str = "",
+    max_retries: int = MAX_RETRIES,
+    on_rate_limit=None,
+) -> str:
+    """
+    Wraps call_claude with exponential backoff on HTTP 429 rate-limit errors.
+    on_rate_limit: optional callable(wait_secs, attempt) for UI feedback.
+    """
+    delay = RETRY_BASE_DELAY
+    for attempt in range(max_retries):
+        try:
+            return call_claude(csv_text, system_prompt, model, client, tracker, columns, extra_context)
+        except anthropic.RateLimitError as e:
+            if attempt >= max_retries - 1:
+                raise
+            # Honour Retry-After header when present
+            wait = delay
+            try:
+                retry_after = e.response.headers.get("retry-after")
+                if retry_after:
+                    wait = max(int(retry_after), delay)
+            except Exception:
+                pass
+            if on_rate_limit:
+                on_rate_limit(wait, attempt + 1)
+            else:
+                print(f"  Rate limited (429). Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
+            time.sleep(wait)
+            delay = min(delay * 2, 300)  # cap at 5 min
+
+
+# ---------------------------------------------------------------------------
+# Price range helper for consistent tier labels across batches
+# ---------------------------------------------------------------------------
+
+def _catalog_price_note(df: pd.DataFrame) -> str:
+    """Return a short context string with the full catalog's price range."""
+    prices: list[float] = []
+    currency = ""
+    for price_str in df["price"].dropna().astype(str):
+        for curr in CURRENCY_TO_LOCALE:
+            if curr in price_str:
+                currency = curr
+                m = re.search(r"[\d.]+", price_str.replace(",", "."))
+                if m:
+                    try:
+                        prices.append(float(m.group()))
+                    except ValueError:
+                        pass
+                break
+    if not prices:
+        return ""
+    lo, hi = min(prices), max(prices)
+    return (
+        f"CONTEXT — full catalog price range: {currency} {lo:.2f} to {currency} {hi:.2f}. "
+        "Use this for consistent price tier labels (bottom third = budget, middle = mid, top = premium). "
+        "This batch is a slice of a larger feed; apply tiers relative to the full range above."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batched optimizer call
+# ---------------------------------------------------------------------------
+
+def call_claude_batched(
+    csv_text: str,
+    system_prompt: str,
+    model: str,
+    client: anthropic.Anthropic,
+    tracker: "CostTracker",
+    columns: list[str] | None = None,
+    batch_size: int = BATCH_SIZE,
+    on_batch_start=None,   # (batch_num: int, total: int) -> None
+    on_batch_done=None,    # (batch_num: int, total: int) -> None
+    on_rate_limit=None,    # (wait_secs: int, attempt: int) -> None
+) -> str:
+    """
+    Split csv_text into batches of batch_size rows, call Claude on each,
+    and merge the results into a single CSV string.
+
+    For feeds that fit in one batch, this is a direct pass-through.
+    """
+    reader_df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
+    total_rows = len(reader_df)
+
+    if total_rows <= batch_size:
+        return call_claude_with_retry(
+            csv_text, system_prompt, model, client, tracker, columns,
+            on_rate_limit=on_rate_limit,
+        )
+
+    price_note = _catalog_price_note(reader_df)
+    batches = [reader_df.iloc[i : i + batch_size] for i in range(0, total_rows, batch_size)]
+    total_batches = len(batches)
+    print(f"Feed has {total_rows} rows — processing in {total_batches} batches of {batch_size}.")
+
+    all_lines: list[str] = []
+    header_written = False
+
+    for batch_num, batch_df in enumerate(batches, 1):
+        if on_batch_start:
+            on_batch_start(batch_num, total_batches)
+        else:
+            print(f"  Batch {batch_num}/{total_batches}...")
+
+        batch_csv = batch_df.to_csv(index=False)
+        raw = call_claude_with_retry(
+            batch_csv, system_prompt, model, client, tracker, columns,
+            extra_context=price_note,
+            on_rate_limit=on_rate_limit,
+        )
+        csv_part, _ = extract_csv_and_summary(raw)
+
+        if csv_part and ("optimized_title" in csv_part or "audit_flags" in csv_part):
+            lines = csv_part.splitlines()
+            if not header_written:
+                all_lines.extend(lines)
+                header_written = True
+            else:
+                all_lines.extend(lines[1:])  # skip duplicate header
+        else:
+            print(f"  WARNING: Batch {batch_num} produced no parseable CSV — skipped.")
+
+        if on_batch_done:
+            on_batch_done(batch_num, total_batches)
+        else:
+            print(f"  Batch {batch_num}/{total_batches} done.")
+
+    return "\n".join(all_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -662,12 +818,15 @@ Examples:
             enriched_df = enrich_dataframe(df, briefs, angles if angles else None)
             csv_text = enriched_df.to_csv(index=False)
 
-    # ── Claude optimizer call ──────────────────────────────────────────────
+    # ── Claude optimizer call (batched + retry) ───────────────────────────
     print(f"\nCalling Claude optimizer ({args.model})...")
     system_prompt = load_system_prompt()
 
     try:
-        raw_response = call_claude(csv_text, system_prompt, args.model, client, tracker)
+        raw_response = call_claude_batched(csv_text, system_prompt, args.model, client, tracker)
+    except anthropic.RateLimitError as e:
+        print(f"ERROR: Claude API rate limit exceeded after {MAX_RETRIES} retries: {e.message}")
+        sys.exit(1)
     except anthropic.APIStatusError as e:
         print(f"ERROR: Claude API returned an error: {e.status_code} — {e.message}")
         sys.exit(1)

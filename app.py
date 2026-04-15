@@ -7,9 +7,10 @@ import anthropic
 
 from scraper import scrape_products
 from optimize import (
+    BATCH_SIZE,
     CostTracker,
     build_url_map,
-    call_claude,
+    call_claude_batched,
     enrich_dataframe,
     extract_csv_and_summary,
     extract_structured_briefs,
@@ -281,11 +282,49 @@ if run_clicked and uploaded_file:
             st.write("Scraping skipped.")
             csv_text = df.to_csv(index=False)
 
-        # Step 3: Optimize
-        st.write(f"Calling Claude ({model})...")
+        # Step 3: Optimize (batched for large feeds)
+        total_rows_for_batch = len(pd.read_csv(io.StringIO(csv_text), dtype=str))
+        total_batches = max(1, -(-total_rows_for_batch // BATCH_SIZE))  # ceiling division
+        batch_label = f"{total_batches} batch{'es' if total_batches > 1 else ''} of {BATCH_SIZE}"
+        st.write(f"Calling Claude ({model}) — {total_rows_for_batch} rows, {batch_label}...")
+
+        progress_bar = st.progress(0, text="Starting...")
+        rate_limit_placeholder = st.empty()
+
+        def on_batch_start(batch_num, total):
+            progress_bar.progress(
+                (batch_num - 1) / total,
+                text=f"Batch {batch_num}/{total}...",
+            )
+
+        def on_batch_done(batch_num, total):
+            progress_bar.progress(
+                batch_num / total,
+                text=f"✓ Batch {batch_num}/{total} complete",
+            )
+
+        def on_rate_limit(wait_secs, attempt):
+            rate_limit_placeholder.warning(
+                f"Rate limit hit — waiting {wait_secs}s before retry {attempt}/{6}..."
+            )
+
         system_prompt = load_system_prompt()
         try:
-            raw_response = call_claude(csv_text, system_prompt, model, client, tracker, columns=selected_columns)
+            raw_response = call_claude_batched(
+                csv_text,
+                system_prompt,
+                model,
+                client,
+                tracker,
+                columns=selected_columns,
+                on_batch_start=on_batch_start,
+                on_batch_done=on_batch_done,
+                on_rate_limit=on_rate_limit,
+            )
+        except anthropic.RateLimitError as e:
+            status.update(label="API error", state="error")
+            st.error(f"Claude API error 429: {e.message}")
+            st.stop()
         except anthropic.APIStatusError as e:
             status.update(label="API error", state="error")
             st.error(f"Claude API error {e.status_code}: {e.message}")
@@ -295,6 +334,8 @@ if run_clicked and uploaded_file:
             st.error(f"Could not connect to Claude API: {e}")
             st.stop()
 
+        rate_limit_placeholder.empty()
+        progress_bar.empty()
         st.write("✓ Optimization complete")
         status.update(label="Done!", state="complete", expanded=False)
 
