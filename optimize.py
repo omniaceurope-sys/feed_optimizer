@@ -20,7 +20,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -107,14 +109,16 @@ class CostTracker:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self._lock = threading.Lock()
 
     def record(self, model: str, input_tokens: int, output_tokens: int, label: str = "") -> None:
-        self.calls.append({
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "label": label,
-        })
+        with self._lock:
+            self.calls.append({
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "label": label,
+            })
 
     def total_cost(self) -> float:
         total = 0.0
@@ -183,26 +187,36 @@ def build_url_map(df: pd.DataFrame) -> dict[str, str]:
 # Brief extraction (Haiku per product page)
 # ---------------------------------------------------------------------------
 
+BRIEF_WORKERS = 20   # concurrent Haiku calls for brief extraction
+
+
 def extract_structured_briefs(
     scraped: dict[str, str],
     client: anthropic.Anthropic,
     tracker: "CostTracker",
     verbose: bool = True,
+    on_progress=None,   # optional callable(done: int, total: int)
 ) -> dict[str, str]:
     """
     For each scraped page text, call Claude Haiku to produce a structured brief.
+    Runs BRIEF_WORKERS calls concurrently for speed on large feeds.
     Returns {base_id: brief_text}. Empty string if page was not scraped.
     """
     if verbose:
-        print(f"\nExtracting structured briefs ({BRIEF_MODEL})...")
+        print(f"\nExtracting structured briefs ({BRIEF_MODEL}, {BRIEF_WORKERS} workers)...")
 
     briefs: dict[str, str] = {}
+    done_count = [0]
 
-    for base_id, page_text in scraped.items():
-        if not page_text.strip():
-            briefs[base_id] = ""
-            continue
+    # Pre-populate empties so they don't go through the thread pool
+    ids_with_text = {bid: text for bid, text in scraped.items() if text.strip()}
+    for bid in scraped:
+        if not scraped[bid].strip():
+            briefs[bid] = ""
 
+    total = len(ids_with_text)
+
+    def _extract_one(base_id: str, page_text: str) -> tuple[str, str, int, int]:
         try:
             message = client.messages.create(
                 model=BRIEF_MODEL,
@@ -216,19 +230,27 @@ def extract_structured_briefs(
                 }],
             )
             brief = message.content[0].text.strip()
-            briefs[base_id] = brief
-            tracker.record(
-                BRIEF_MODEL,
-                message.usage.input_tokens,
-                message.usage.output_tokens,
-                label=base_id,
-            )
-            if verbose:
-                print(f"  [{base_id}] {len(brief)} chars")
+            return base_id, brief, message.usage.input_tokens, message.usage.output_tokens
         except Exception as e:
-            briefs[base_id] = ""
             if verbose:
                 print(f"  [{base_id}] FAILED: {e}")
+            return base_id, "", 0, 0
+
+    with ThreadPoolExecutor(max_workers=BRIEF_WORKERS) as executor:
+        futures = {
+            executor.submit(_extract_one, bid, text): bid
+            for bid, text in ids_with_text.items()
+        }
+        for future in as_completed(futures):
+            base_id, brief, in_tok, out_tok = future.result()
+            briefs[base_id] = brief
+            if in_tok:
+                tracker.record(BRIEF_MODEL, in_tok, out_tok, label=base_id)
+            done_count[0] += 1
+            if on_progress:
+                on_progress(done_count[0], total)
+            elif verbose:
+                print(f"  [{base_id}] {len(brief)} chars ({done_count[0]}/{total})")
 
     return briefs
 

@@ -265,13 +265,32 @@ if run_clicked and uploaded_file:
             url_map = build_url_map(df)
             scrape_total = len(url_map)
             if url_map:
-                scraped = scrape_products(url_map, verbose=False)
+                scrape_bar = st.progress(0, text="Fetching pages...")
+
+                def on_scrape_progress(done, total):
+                    scrape_bar.progress(done / total, text=f"Scraped {done}/{total} pages...")
+
+                scraped = scrape_products(url_map, verbose=False, on_progress=on_scrape_progress)
                 scrape_ok = sum(1 for v in scraped.values() if v.strip())
+                scrape_bar.empty()
                 st.write(f"✓ {scrape_ok}/{scrape_total} pages scraped")
 
                 # Step 2: Extract structured briefs
-                st.write("Extracting structured briefs...")
-                briefs = extract_structured_briefs(scraped, client, tracker, verbose=False)
+                pages_with_content = sum(1 for v in scraped.values() if v.strip())
+                if pages_with_content:
+                    st.write(f"Extracting structured briefs ({pages_with_content} pages)...")
+                    brief_bar = st.progress(0, text="Extracting briefs...")
+
+                    def on_brief_progress(done, total):
+                        brief_bar.progress(done / total, text=f"Briefs {done}/{total}...")
+
+                    briefs = extract_structured_briefs(
+                        scraped, client, tracker, verbose=False, on_progress=on_brief_progress
+                    )
+                    brief_bar.empty()
+                else:
+                    briefs = extract_structured_briefs(scraped, client, tracker, verbose=False)
+
                 enriched_df = enrich_dataframe(df, briefs)
                 csv_text = enriched_df.to_csv(index=False)
                 st.write("✓ Structured briefs ready")
