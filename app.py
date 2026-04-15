@@ -219,6 +219,14 @@ with st.expander("Columns to optimize", expanded=True):
         opt_label3      = st.checkbox("Label 3 — Pack type",       value=True, key="col_l3")
         opt_label4      = st.checkbox("Label 4 — Audience",        value=True, key="col_l4")
 
+    st.divider()
+    include_brand_in_title = st.checkbox(
+        "Include brand name in optimized titles",
+        value=False,
+        key="include_brand",
+        help="Enable only if your Merchant Center feed rules do NOT already append the brand.",
+    )
+
 selected_columns = [
     col for col, enabled in [
         ("optimized_title",        opt_title),
@@ -328,6 +336,13 @@ if run_clicked and uploaded_file:
             )
 
         system_prompt = load_system_prompt()
+        brand_instruction = (
+            "" if include_brand_in_title else
+            "IMPORTANT OVERRIDE: Do NOT include the brand name in any optimized_title. "
+            "The brand is appended automatically by a Merchant Center feed rule — "
+            "including it here would cause it to appear twice. "
+            "Start every title directly with the symptom or product name, skipping the brand entirely."
+        )
         try:
             raw_response = call_claude_batched(
                 csv_text,
@@ -336,6 +351,7 @@ if run_clicked and uploaded_file:
                 client,
                 tracker,
                 columns=selected_columns,
+                extra_context=brand_instruction,
                 on_batch_start=on_batch_start,
                 on_batch_done=on_batch_done,
                 on_rate_limit=on_rate_limit,

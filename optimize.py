@@ -592,6 +592,7 @@ def call_claude_batched(
     client: anthropic.Anthropic,
     tracker: "CostTracker",
     columns: list[str] | None = None,
+    extra_context: str = "",
     batch_size: int = BATCH_SIZE,
     on_batch_start=None,   # (batch_num: int, total: int) -> None
     on_batch_done=None,    # (batch_num: int, total: int) -> None
@@ -609,10 +610,14 @@ def call_claude_batched(
     if total_rows <= batch_size:
         return call_claude_with_retry(
             csv_text, system_prompt, model, client, tracker, columns,
+            extra_context=extra_context,
             on_rate_limit=on_rate_limit,
         )
 
+    # Combine caller's extra_context with the price range note
     price_note = _catalog_price_note(reader_df)
+    combined_context = "\n\n".join(filter(None, [extra_context, price_note]))
+
     batches = [reader_df.iloc[i : i + batch_size] for i in range(0, total_rows, batch_size)]
     total_batches = len(batches)
     print(f"Feed has {total_rows} rows — processing in {total_batches} batches of {batch_size}.")
@@ -629,7 +634,7 @@ def call_claude_batched(
         batch_csv = batch_df.to_csv(index=False)
         raw = call_claude_with_retry(
             batch_csv, system_prompt, model, client, tracker, columns,
-            extra_context=price_note,
+            extra_context=combined_context,
             on_rate_limit=on_rate_limit,
         )
         csv_part, _ = extract_csv_and_summary(raw)
