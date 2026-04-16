@@ -23,8 +23,10 @@ import sys
 import threading
 import time
 
-# Ensure stdout can handle Unicode on Windows terminals (skip on Streamlit Cloud)
-if hasattr(sys.stdout, "buffer") and not sys.stdout.buffer.closed:
+# Ensure stdout can handle Unicode on Windows terminals.
+# Skip when running under Streamlit — Streamlit manages its own stdout and
+# wrapping it causes "I/O operation on closed file" errors mid-execution.
+if "streamlit" not in sys.modules and hasattr(sys.stdout, "buffer") and not sys.stdout.buffer.closed:
     try:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     except Exception:
