@@ -393,7 +393,19 @@ def scrape_products(
     if verbose:
         print(f"  Fetching {len(url_map)} pages (max {MAX_CONCURRENT} concurrent, {FETCH_RETRIES} retries)...")
 
-    results = asyncio.run(_scrape_all(url_map, on_progress=on_progress))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Streamlit (and Jupyter) run their own event loop — use a thread to avoid conflict
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _scrape_all(url_map, on_progress=on_progress))
+            results = future.result()
+    else:
+        results = asyncio.run(_scrape_all(url_map, on_progress=on_progress))
 
     if verbose:
         ok = sum(1 for v in results.values() if v.strip())

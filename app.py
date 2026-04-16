@@ -403,6 +403,13 @@ if run_clicked and uploaded_file:
             return title
         result_df["optimized_title"] = result_df.apply(_append_brand, axis=1)
 
+    # Strip keyword_planner_unavailable from audit_flags — it's not configured in
+    # the app (no Google Ads credentials in Streamlit), so it's noise not a real issue
+    if "audit_flags" in result_df.columns:
+        result_df["audit_flags"] = result_df["audit_flags"].str.replace(
+            r";?keyword_planner_unavailable;?", "", regex=True
+        ).str.strip(";")
+
     output_csv = result_df.to_csv(index=False, encoding="utf-8")
 
     total_cost = tracker.total_cost()
