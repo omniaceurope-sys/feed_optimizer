@@ -340,10 +340,8 @@ if run_clicked and uploaded_file:
 
         system_prompt = load_system_prompt()
         brand_instruction = (
-            "" if include_brand_in_title else
-            "IMPORTANT OVERRIDE: Do NOT include the brand name in any optimized_title. "
-            "The brand is appended automatically by a Merchant Center feed rule — "
-            "including it here would cause it to appear twice. "
+            "IMPORTANT OVERRIDE: Do NOT include the brand name at the start of any optimized_title. "
+            "The brand will be appended at the end automatically as '| Brand'. "
             "Start every title directly with the symptom or product name, skipping the brand entirely."
         )
         try:
@@ -389,14 +387,20 @@ if run_clicked and uploaded_file:
     # Merge Claude's compact output back into original DataFrame
     result_df = merge_claude_output(df, csv_output)
 
-    # Append brand to optimized_title
-    if include_brand_in_title and "brand" in result_df.columns and "optimized_title" in result_df.columns:
+    # Always append brand at the end of optimized_title
+    if "brand" in result_df.columns and "optimized_title" in result_df.columns:
         def _append_brand(row):
             title = str(row["optimized_title"]).strip()
             brand = str(row["brand"]).strip()
-            if not title or not brand or brand.lower() in title.lower():
+            if not title or not brand:
                 return title
-            return f"{title} | {brand}"
+            # Strip brand from start if Claude included it despite the instruction
+            if title.lower().startswith(brand.lower()):
+                title = title[len(brand):].lstrip(" |,-")
+            # Append at end if not already there
+            if not title.lower().endswith(brand.lower()):
+                title = f"{title} | {brand}"
+            return title
         result_df["optimized_title"] = result_df.apply(_append_brand, axis=1)
 
     output_csv = result_df.to_csv(index=False, encoding="utf-8")

@@ -1086,14 +1086,20 @@ Examples:
     # ── Merge Claude output back into original DataFrame ───────────────────
     result_df = merge_claude_output(df, csv_output)
 
-    # ── Append brand to optimized_title if present ─────────────────────────
+    # ── Append brand at end of optimized_title ─────────────────────────────
     if "brand" in result_df.columns and "optimized_title" in result_df.columns:
         def _append_brand(row: pd.Series) -> str:
             title = str(row["optimized_title"]).strip()
             brand = str(row["brand"]).strip()
-            if not title or not brand or brand.lower() in title.lower():
+            if not title or not brand:
                 return title
-            return f"{title} | {brand}"
+            # Strip brand from start if Claude included it despite the instruction
+            if title.lower().startswith(brand.lower()):
+                title = title[len(brand):].lstrip(" |,-")
+            # Append at end if not already there
+            if not title.lower().endswith(brand.lower()):
+                title = f"{title} | {brand}"
+            return title
         result_df["optimized_title"] = result_df.apply(_append_brand, axis=1)
 
     # ── Write output ───────────────────────────────────────────────────────
