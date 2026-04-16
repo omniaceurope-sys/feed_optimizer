@@ -279,6 +279,19 @@ def extract_page_text(html: str) -> str:
 # Async fetching
 # ---------------------------------------------------------------------------
 
+def _shopify_json_url_from_path(page_url: str) -> Optional[str]:
+    """
+    Build a Shopify product JSON URL from the page URL alone (no HTML needed).
+    Returns None if the URL doesn't look like a Shopify product page.
+    """
+    parsed = urlparse(page_url)
+    # Strip query string from path before appending .json
+    path = parsed.path.rstrip("/")
+    if "/products/" in path and not path.endswith(".json"):
+        return f"{parsed.scheme}://{parsed.netloc}{path}.json"
+    return None
+
+
 async def _fetch_one(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
@@ -290,11 +303,35 @@ async def _fetch_one(
 ) -> tuple[str, str, bool]:
     """
     Fetch one URL with retry. Returns (base_id, extracted_text, success).
-    Tries: HTML → JSON-LD within HTML → Shopify API → retry up to FETCH_RETRIES times.
+    Priority order:
+      1. Shopify JSON API (tried first for /products/ URLs — bypasses Cloudflare HTML blocks)
+      2. HTML → JSON-LD / heuristics extraction
+      3. Retry up to FETCH_RETRIES times on transient errors.
     """
     async with sem:
         text = ""
         success = False
+
+        # Try Shopify JSON API first if the URL looks like a Shopify product page.
+        # This bypasses Cloudflare protection that may block the HTML page on cloud hosts.
+        shopify_json_url = _shopify_json_url_from_path(url)
+        if shopify_json_url:
+            try:
+                sj_resp = await client.get(shopify_json_url, follow_redirects=True)
+                if sj_resp.status_code == 200:
+                    shopify_data = sj_resp.json()
+                    text = _parse_shopify_json(shopify_data)
+                    if len(text) > 100:
+                        success = True
+            except Exception:
+                pass  # fall through to HTML fetch
+
+        if success:
+            if done_counter is not None:
+                done_counter[0] += 1
+                if on_progress:
+                    on_progress(done_counter[0], total)
+            return base_id, text, success
 
         for attempt in range(FETCH_RETRIES):
             try:
@@ -305,19 +342,21 @@ async def _fetch_one(
                 except UnicodeDecodeError:
                     html = response.content.decode(response.encoding or "utf-8", errors="replace")
 
-                # Try Shopify JSON API if this looks like a Shopify store
-                shopify_url = _shopify_json_url(url, html)
-                if shopify_url:
-                    try:
-                        sj_resp = await client.get(shopify_url, follow_redirects=True)
-                        if sj_resp.status_code == 200:
-                            shopify_data = sj_resp.json()
-                            text = _parse_shopify_json(shopify_data)
-                            if len(text) > 100:
-                                success = True
-                                break
-                    except Exception:
-                        pass  # fall through to HTML extraction
+                # Try Shopify JSON API again if HTML hints at Shopify (in case the
+                # path-based URL above was wrong, e.g. non-standard handle format)
+                if not success:
+                    shopify_url = _shopify_json_url(url, html)
+                    if shopify_url and shopify_url != shopify_json_url:
+                        try:
+                            sj_resp = await client.get(shopify_url, follow_redirects=True)
+                            if sj_resp.status_code == 200:
+                                shopify_data = sj_resp.json()
+                                text = _parse_shopify_json(shopify_data)
+                                if len(text) > 100:
+                                    success = True
+                                    break
+                        except Exception:
+                            pass  # fall through to HTML extraction
 
                 text = extract_page_text(html)
                 if text.strip():
