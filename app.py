@@ -387,6 +387,11 @@ if run_clicked and uploaded_file:
     # Merge Claude's compact output back into original DataFrame
     result_df = merge_claude_output(df, csv_output)
 
+    # Fall back to original title for any row Claude missed
+    if "optimized_title" in result_df.columns and "title" in result_df.columns:
+        mask = result_df["optimized_title"].str.strip() == ""
+        result_df.loc[mask, "optimized_title"] = result_df.loc[mask, "title"]
+
     # Always append brand at the end of optimized_title
     if "brand" in result_df.columns and "optimized_title" in result_df.columns:
         def _append_brand(row):
