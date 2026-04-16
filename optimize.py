@@ -23,13 +23,19 @@ import sys
 import threading
 import time
 
-# Ensure stdout can handle Unicode on Windows terminals.
-# Skip when running under Streamlit — Streamlit manages its own stdout and
-# wrapping it causes "I/O operation on closed file" errors mid-execution.
+# Ensure stdout can handle Unicode on Windows terminals (CLI only).
 if "streamlit" not in sys.modules and hasattr(sys.stdout, "buffer") and not sys.stdout.buffer.closed:
     try:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     except Exception:
+        pass
+
+
+def _print(*args, **kwargs):
+    """print() wrapper that silently ignores closed-file errors (Streamlit reruns)."""
+    try:
+        print(*args, **kwargs)
+    except (ValueError, OSError):
         pass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -142,7 +148,7 @@ class CostTracker:
         return total
 
     def print_summary(self) -> None:
-        print("\n--- Cost breakdown ---")
+        _print("\n--- Cost breakdown ---")
         for call in self.calls:
             in_price, out_price = MODEL_PRICING.get(call["model"], (0, 0))
             cost = (
@@ -150,12 +156,12 @@ class CostTracker:
                 + call["output_tokens"] / 1_000_000 * out_price
             )
             label = f"  [{call['label']}]" if call["label"] else ""
-            print(
+            _print(
                 f"  {call['model']}{label}: "
                 f"{call['input_tokens']:,} in + {call['output_tokens']:,} out "
                 f"= ${cost:.4f}"
             )
-        print(f"  TOTAL: ${self.total_cost():.4f}")
+        _print(f"  TOTAL: ${self.total_cost():.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +301,7 @@ def extract_structured_briefs(
     Returns {base_id: brief_text}. Empty string if page was not scraped.
     """
     if verbose:
-        print(f"\nExtracting structured briefs ({BRIEF_MODEL}, {BRIEF_WORKERS} workers)...")
+        _print(f"\nExtracting structured briefs ({BRIEF_MODEL}, {BRIEF_WORKERS} workers)...")
 
     briefs: dict[str, str] = {}
     done_count = [0]
@@ -325,7 +331,7 @@ def extract_structured_briefs(
             return base_id, brief, message.usage.input_tokens, message.usage.output_tokens
         except Exception as e:
             if verbose:
-                print(f"  [{base_id}] FAILED: {e}")
+                _print(f"  [{base_id}] FAILED: {e}")
             return base_id, "", 0, 0
 
     with ThreadPoolExecutor(max_workers=BRIEF_WORKERS) as executor:
@@ -342,7 +348,7 @@ def extract_structured_briefs(
             if on_progress:
                 on_progress(done_count[0], total)
             elif verbose:
-                print(f"  [{base_id}] {len(brief)} chars ({done_count[0]}/{total})")
+                _print(f"  [{base_id}] {len(brief)} chars ({done_count[0]}/{total})")
 
     return briefs
 
@@ -404,21 +410,21 @@ def _call_planner_script(keywords: list[str], language: str, location: str) -> l
     """Call keyword_planner.py as a subprocess and return parsed JSON results."""
     script = Path(__file__).parent / "scripts" / "keyword_planner.py"
     if not script.exists():
-        print("  [keyword_planner] ERROR: script not found at", script, file=sys.stderr)
+        _print("  [keyword_planner] ERROR: script not found at", script, file=sys.stderr)
         return []
     cmd = [sys.executable, str(script), "--keywords", *keywords, "--language", language, "--location", location]
     try:
         result = subprocess.run(cmd, capture_output=True, cwd=Path(__file__).parent, timeout=120)
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            print(f"  [keyword_planner] FAILED (exit {result.returncode}): {stderr}", file=sys.stderr)
+            _print(f"  [keyword_planner] FAILED (exit {result.returncode}): {stderr}", file=sys.stderr)
             return []
         return json.loads(result.stdout.decode("utf-8"))
     except subprocess.TimeoutExpired:
-        print("  [keyword_planner] TIMEOUT after 120s", file=sys.stderr)
+        _print("  [keyword_planner] TIMEOUT after 120s", file=sys.stderr)
         return []
     except Exception as exc:
-        print(f"  [keyword_planner] EXCEPTION: {exc}", file=sys.stderr)
+        _print(f"  [keyword_planner] EXCEPTION: {exc}", file=sys.stderr)
         return []
 
 
@@ -452,7 +458,7 @@ def build_keyword_angles(
     Returns {base_id: angles_text} — empty string if planner unavailable.
     """
     if verbose:
-        print(f"\nRunning Keyword Planner (language={language}, location={location})...")
+        _print(f"\nRunning Keyword Planner (language={language}, location={location})...")
 
     angles: dict[str, str] = {}
 
@@ -467,7 +473,7 @@ def build_keyword_angles(
         if not all_candidates:
             angles[base_id] = ""
             if verbose:
-                print(f"  [{base_id}] no candidates extracted from brief")
+                _print(f"  [{base_id}] no candidates extracted from brief")
             continue
 
         results = _call_planner_script(all_candidates, language, location)
@@ -475,7 +481,7 @@ def build_keyword_angles(
         if not results:
             angles[base_id] = "keyword_planner_unavailable"
             if verbose:
-                print(f"  [{base_id}] planner unavailable — will use Claude's estimates")
+                _print(f"  [{base_id}] planner unavailable — will use Claude's estimates")
             continue
 
         sym_set = {c.lower().strip() for c in symptom_candidates}
@@ -497,7 +503,7 @@ def build_keyword_angles(
         if verbose:
             top_sym = ranked_sym[0]["keyword"] if ranked_sym else "—"
             top_vol = ranked_sym[0]["avg_monthly_searches"] if ranked_sym else 0
-            print(f"  [{base_id}] {len(ranked_sym)} symptoms, {len(ranked_ing)} ingredients "
+            _print(f"  [{base_id}] {len(ranked_sym)} symptoms, {len(ranked_ing)} ingredients "
                   f"— top: \"{top_sym}\" ({top_vol}/mo)")
 
     return angles
@@ -659,7 +665,7 @@ def call_claude_with_retry(
             if on_rate_limit:
                 on_rate_limit(wait, attempt + 1)
             else:
-                print(f"  Rate limited (429). Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
+                _print(f"  Rate limited (429). Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
             time.sleep(wait)
             delay = min(delay * 2, 300)  # cap at 5 min
 
@@ -732,7 +738,7 @@ def call_claude_batched(
 
     batches = [reader_df.iloc[i : i + batch_size] for i in range(0, total_rows, batch_size)]
     total_batches = len(batches)
-    print(f"Feed has {total_rows} rows — processing in {total_batches} batches of {batch_size}.")
+    _print(f"Feed has {total_rows} rows — processing in {total_batches} batches of {batch_size}.")
 
     all_lines: list[str] = []
     header_written = False
@@ -741,7 +747,7 @@ def call_claude_batched(
         if on_batch_start:
             on_batch_start(batch_num, total_batches)
         else:
-            print(f"  Batch {batch_num}/{total_batches}...")
+            _print(f"  Batch {batch_num}/{total_batches}...")
 
         batch_csv = batch_df.to_csv(index=False)
         raw = call_claude_with_retry(
@@ -759,12 +765,12 @@ def call_claude_batched(
             else:
                 all_lines.extend(lines[1:])  # skip duplicate header
         else:
-            print(f"  WARNING: Batch {batch_num} produced no parseable CSV — skipped.")
+            _print(f"  WARNING: Batch {batch_num} produced no parseable CSV — skipped.")
 
         if on_batch_done:
             on_batch_done(batch_num, total_batches)
         else:
-            print(f"  Batch {batch_num}/{total_batches} done.")
+            _print(f"  Batch {batch_num}/{total_batches} done.")
 
     return "\n".join(all_lines)
 
@@ -848,18 +854,18 @@ def merge_claude_output(original_df: pd.DataFrame, claude_csv: str) -> pd.DataFr
         reader = csv.reader(io.StringIO(claude_csv))
         raw_rows = list(reader)
     except Exception as e:
-        print(f"  WARNING: Could not parse Claude output CSV: {e}")
+        _print(f"  WARNING: Could not parse Claude output CSV: {e}")
         return original_df
 
     if not raw_rows:
-        print("  WARNING: Claude output CSV is empty — cannot merge.")
+        _print("  WARNING: Claude output CSV is empty — cannot merge.")
         return original_df
 
     raw_header = [c.strip().lower().replace(" ", "_") for c in raw_rows[0]]
     n_cols = len(raw_header)
 
     if "id" not in raw_header:
-        print("  WARNING: Claude output has no 'id' column — cannot merge.")
+        _print("  WARNING: Claude output has no 'id' column — cannot merge.")
         return original_df
 
     fixed_data = []
@@ -912,7 +918,7 @@ def save_raw_response(response: str, output_path: Path) -> None:
     """Save the full raw Claude response alongside the output CSV for debugging."""
     debug_path = output_path.with_suffix(".debug.txt")
     debug_path.write_text(response, encoding="utf-8")
-    print(f"  Raw response saved: {debug_path}")
+    _print(f"  Raw response saved: {debug_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -977,22 +983,22 @@ Examples:
     # ── API key check ──────────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY is not set.")
-        print("  Copy .env.example to .env and add your key, or run:")
-        print("  export ANTHROPIC_API_KEY=sk-ant-...")
+        _print("ERROR: ANTHROPIC_API_KEY is not set.")
+        _print("  Copy .env.example to .env and add your key, or run:")
+        _print("  export ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
 
     # ── Load input CSV ─────────────────────────────────────────────────────
     input_path = Path(args.input)
     if not input_path.exists():
-        print(f"ERROR: File not found: {input_path}")
+        _print(f"ERROR: File not found: {input_path}")
         sys.exit(1)
 
-    print(f"\nReading: {input_path}")
+    _print(f"\nReading: {input_path}")
     df = read_feed_csv(input_path)
 
     unique_products = df.apply(get_group_id, axis=1).nunique()
-    print(f"  {len(df)} rows | {unique_products} unique products")
+    _print(f"  {len(df)} rows | {unique_products} unique products")
 
     # ── Determine output path ──────────────────────────────────────────────
     output_path = Path(args.output) if args.output else default_output_path(input_path, args.output_suffix)
@@ -1003,13 +1009,13 @@ Examples:
 
     # ── Scraping + brief extraction ────────────────────────────────────────
     if args.no_scrape:
-        print("\nScraping skipped (--no-scrape).")
+        _print("\nScraping skipped (--no-scrape).")
         csv_text = df.to_csv(index=False)
     else:
-        print("\nScraping product pages...")
+        _print("\nScraping product pages...")
         url_map = build_url_map(df)
         if not url_map:
-            print("  WARNING: No valid URLs found in 'link' column. Falling back to CSV data only.")
+            _print("  WARNING: No valid URLs found in 'link' column. Falling back to CSV data only.")
             csv_text = df.to_csv(index=False)
         else:
             scraped = scrape_products(url_map, verbose=True)
@@ -1033,19 +1039,19 @@ Examples:
             csv_text = enriched_df.to_csv(index=False)
 
     # ── Claude optimizer call (batched + retry) ───────────────────────────
-    print(f"\nCalling Claude optimizer ({args.model})...")
+    _print(f"\nCalling Claude optimizer ({args.model})...")
     system_prompt = load_system_prompt()
 
     try:
         raw_response = call_claude_batched(csv_text, system_prompt, args.model, client, tracker)
     except anthropic.RateLimitError as e:
-        print(f"ERROR: Claude API rate limit exceeded after {MAX_RETRIES} retries: {e.message}")
+        _print(f"ERROR: Claude API rate limit exceeded after {MAX_RETRIES} retries: {e.message}")
         sys.exit(1)
     except anthropic.APIStatusError as e:
-        print(f"ERROR: Claude API returned an error: {e.status_code} — {e.message}")
+        _print(f"ERROR: Claude API returned an error: {e.status_code} — {e.message}")
         sys.exit(1)
     except anthropic.APIConnectionError as e:
-        print(f"ERROR: Could not connect to Claude API: {e}")
+        _print(f"ERROR: Could not connect to Claude API: {e}")
         sys.exit(1)
 
     if args.save_debug:
@@ -1055,8 +1061,8 @@ Examples:
     csv_output, summary = extract_csv_and_summary(raw_response)
 
     if not csv_output or "optimized_title" not in csv_output:
-        print("\nWARNING: Could not reliably extract CSV from response.")
-        print("  Saving full response as .debug.txt for inspection.")
+        _print("\nWARNING: Could not reliably extract CSV from response.")
+        _print("  Saving full response as .debug.txt for inspection.")
         save_raw_response(raw_response, output_path)
         csv_output = csv_output or raw_response
 
@@ -1069,8 +1075,8 @@ Examples:
         missing_ids = set()
 
     if missing_ids:
-        print(f"\nWARNING: {len(missing_ids)} rows missing from output: {sorted(missing_ids)}")
-        print("  Retrying with missing rows only...")
+        _print(f"\nWARNING: {len(missing_ids)} rows missing from output: {sorted(missing_ids)}")
+        _print("  Retrying with missing rows only...")
         missing_df = enriched_df[enriched_df["id"].isin(missing_ids)]
         try:
             retry_response = call_claude(
@@ -1082,11 +1088,11 @@ Examples:
                 retry_lines = retry_csv.splitlines()
                 retry_data = "\n".join(retry_lines[1:])  # drop header
                 csv_output = csv_output.rstrip() + "\n" + retry_data
-                print(f"  Retry succeeded — appended {len(retry_lines)-1} rows")
+                _print(f"  Retry succeeded — appended {len(retry_lines)-1} rows")
             else:
-                print("  Retry response could not be parsed — missing rows not recovered")
+                _print("  Retry response could not be parsed — missing rows not recovered")
         except Exception as e:
-            print(f"  Retry failed: {e}")
+            _print(f"  Retry failed: {e}")
 
     # ── Merge Claude output back into original DataFrame ───────────────────
     result_df = merge_claude_output(df, csv_output)
@@ -1109,16 +1115,16 @@ Examples:
 
     # ── Write output ───────────────────────────────────────────────────────
     result_df.to_csv(output_path, index=False, encoding="utf-8")
-    print(f"\nOutput written: {output_path}")
+    _print(f"\nOutput written: {output_path}")
 
     if summary:
-        print("\n" + "-" * 60)
-        print("OPTIMIZATION SUMMARY")
-        print("-" * 60)
-        print(summary)
+        _print("\n" + "-" * 60)
+        _print("OPTIMIZATION SUMMARY")
+        _print("-" * 60)
+        _print(summary)
 
     tracker.print_summary()
-    print("\nDone.")
+    _print("\nDone.")
 
 
 if __name__ == "__main__":
