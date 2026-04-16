@@ -23,9 +23,12 @@ import sys
 import threading
 import time
 
-# Ensure stdout can handle Unicode on Windows terminals
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Ensure stdout can handle Unicode on Windows terminals (skip on Streamlit Cloud)
+if hasattr(sys.stdout, "buffer") and not sys.stdout.buffer.closed:
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
