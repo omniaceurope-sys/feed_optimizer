@@ -93,7 +93,11 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 
 BRIEF_EXTRACTION_PROMPT = """\
 Extract a structured product brief from this product page text.
-Return ONLY the following format — no extra text, no explanation:
+Return ONLY the following format — no extra text, no explanation.
+
+IMPORTANT: Copy all phrases VERBATIM from the page text in the original language. \
+Do NOT translate into English. If the page is in Czech, Polish, German, etc., \
+the extracted phrases must stay in that language.
 
 INGREDIENTS: <comma-separated ingredients/materials/components, or — if none>
 CLAIMS: <comma-separated benefit or efficacy claims stated on the page, or —>
