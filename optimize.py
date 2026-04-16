@@ -180,9 +180,11 @@ _PREV_OUTPUT_COLS = {
 }
 
 
-def read_feed_csv(path: Path) -> pd.DataFrame:
+def read_feed_csv(path) -> pd.DataFrame:
     """
     Robustly read a feed CSV and normalise it for the optimizer.
+
+    Accepts a file path (str/Path) or a file-like object (e.g. Streamlit UploadedFile).
 
     Handles:
     - Google Merchant Center export format (column names with spaces)
@@ -190,13 +192,26 @@ def read_feed_csv(path: Path) -> pd.DataFrame:
     - Output columns that are stripped before re-optimizing
     - Rows with more fields than header columns (bad CSV from prev run)
     """
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
+    if hasattr(path, "read"):
+        # File-like object (Streamlit UploadedFile, BytesIO, etc.)
+        raw = path.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        import io as _io
+        f_iter = csv.reader(_io.StringIO(raw))
         try:
-            header = next(reader)
+            header = next(f_iter)
         except StopIteration:
             return pd.DataFrame()
-        rows = list(reader)
+        rows = list(f_iter)
+    else:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return pd.DataFrame()
+            rows = list(reader)
 
     n_cols = len(header)
 
