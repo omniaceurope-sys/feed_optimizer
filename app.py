@@ -390,6 +390,9 @@ if run_clicked and uploaded_file:
     # Fall back to original title for any row Claude missed
     if "optimized_title" in result_df.columns and "title" in result_df.columns:
         mask = result_df["optimized_title"].str.strip() == ""
+        missed = mask.sum()
+        if missed > 0:
+            st.warning(f"{missed} row(s) were not returned by Claude and kept their original title.")
         result_df.loc[mask, "optimized_title"] = result_df.loc[mask, "title"]
 
     # Always append brand at the end of optimized_title

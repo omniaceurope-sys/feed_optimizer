@@ -602,7 +602,11 @@ def call_claude(
         + col_instruction +
         f"IMPORTANT: Output a compact CSV containing ONLY these columns: {output_cols_list}. "
         f"Do NOT repeat or re-output any other original columns — the original data will be "
-        f"merged back in Python. Do NOT include the `{BRIEF_COL}` or `{KEYWORD_ANGLES_COL}` columns.\n\n"
+        f"merged back in Python. Do NOT include the `{BRIEF_COL}` or `{KEYWORD_ANGLES_COL}` columns.\n"
+        "CSV formatting rules — follow exactly:\n"
+        "- Enclose EVERY field value in double quotes, no exceptions\n"
+        "- If a value contains a double quote, escape it as \"\"\n"
+        "- Output exactly one row per input row — do not skip or merge rows\n\n"
         "Return the compact CSV first, then the summary section.\n\n"
         f"```csv\n{csv_text}\n```"
     )
@@ -881,11 +885,17 @@ def merge_claude_output(original_df: pd.DataFrame, claude_csv: str) -> pd.DataFr
 
     claude_df = pd.DataFrame(fixed_data, columns=raw_header).fillna("")
 
+    # Strip whitespace from id values — Claude sometimes adds leading/trailing spaces
+    claude_df["id"] = claude_df["id"].str.strip()
+
     # Keep only id + known output columns that Claude actually produced
     keep = ["id"] + [c for c in OUTPUT_COLS if c in claude_df.columns]
     claude_df = claude_df[keep].drop_duplicates(subset=["id"])
 
+    _print(f"  merge_claude_output: {len(claude_df)} rows from Claude, {len(original_df)} original rows")
+
     result = original_df.copy()
+    result["id"] = result["id"].astype(str).str.strip()
     # Drop any stale output cols from a previous run on the original df
     result = result.drop(columns=[c for c in OUTPUT_COLS if c in result.columns], errors="ignore")
 
