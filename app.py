@@ -15,7 +15,10 @@ from optimize import (
     extract_csv_and_summary,
     extract_structured_briefs,
     get_base_id,
+    get_group_id,
     load_system_prompt,
+    merge_claude_output,
+    read_feed_csv,
 )
 
 # ---------------------------------------------------------------------------
@@ -256,8 +259,8 @@ if not anthropic_ready():
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 if run_clicked and uploaded_file:
-    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
-    unique_products = df["id"].apply(get_base_id).nunique()
+    df = read_feed_csv(uploaded_file)
+    unique_products = df.apply(get_group_id, axis=1).nunique()
     tracker = CostTracker()
     api_key = get_secret("ANTHROPIC_API_KEY")
     client = anthropic.Anthropic(api_key=api_key)
@@ -374,7 +377,7 @@ if run_clicked and uploaded_file:
         st.write("✓ Optimization complete")
         status.update(label="Done!", state="complete", expanded=False)
 
-    # ── Parse & display results ──────────────────────────────────────────────
+    # ── Parse & merge results ────────────────────────────────────────────────
 
     csv_output, summary = extract_csv_and_summary(raw_response)
 
@@ -382,6 +385,21 @@ if run_clicked and uploaded_file:
     if not csv_output or expected_col not in csv_output:
         st.warning("Could not cleanly extract CSV from response. Showing raw output.")
         csv_output = raw_response
+
+    # Merge Claude's compact output back into original DataFrame
+    result_df = merge_claude_output(df, csv_output)
+
+    # Append brand to optimized_title
+    if include_brand_in_title and "brand" in result_df.columns and "optimized_title" in result_df.columns:
+        def _append_brand(row):
+            title = str(row["optimized_title"]).strip()
+            brand = str(row["brand"]).strip()
+            if not title or not brand or brand.lower() in title.lower():
+                return title
+            return f"{title} | {brand}"
+        result_df["optimized_title"] = result_df.apply(_append_brand, axis=1)
+
+    output_csv = result_df.to_csv(index=False, encoding="utf-8")
 
     total_cost = tracker.total_cost()
 
@@ -402,7 +420,7 @@ if run_clicked and uploaded_file:
     output_filename = uploaded_file.name.replace(".csv", "_optimized.csv")
     st.download_button(
         label="⬇ Download optimized CSV",
-        data=csv_output.encode("utf-8"),
+        data=output_csv.encode("utf-8"),
         file_name=output_filename,
         mime="text/csv",
         type="primary",
@@ -440,7 +458,7 @@ if run_clicked and uploaded_file:
 
     with st.expander("Output preview"):
         try:
-            preview_df = pd.read_csv(io.StringIO(csv_output))
+            preview_df = pd.read_csv(io.StringIO(output_csv))
             st.dataframe(preview_df, use_container_width=True)
         except Exception:
-            st.text(csv_output[:3000])
+            st.text(output_csv[:3000])

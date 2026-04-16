@@ -22,6 +22,10 @@ import subprocess
 import sys
 import threading
 import time
+
+# Ensure stdout can handle Unicode on Windows terminals
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -165,21 +169,85 @@ def get_base_id(product_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CSV reading — handles both standard and Google Merchant Center export formats
+# ---------------------------------------------------------------------------
+
+# Output columns added by the optimizer — stripped before re-optimizing
+_PREV_OUTPUT_COLS = {
+    "optimized_title", "optimized_description", "product_type_suggested",
+    "custom_label_0", "custom_label_1", "custom_label_2",
+    "custom_label_3", "custom_label_4", "audit_flags",
+}
+
+
+def read_feed_csv(path: Path) -> pd.DataFrame:
+    """
+    Robustly read a feed CSV and normalise it for the optimizer.
+
+    Handles:
+    - Google Merchant Center export format (column names with spaces)
+    - Extra trailing columns from a previous optimization run
+    - Output columns that are stripped before re-optimizing
+    - Rows with more fields than header columns (bad CSV from prev run)
+    """
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return pd.DataFrame()
+        rows = list(reader)
+
+    n_cols = len(header)
+
+    # Fix row length mismatches
+    fixed_rows: list[list[str]] = []
+    for row in rows:
+        if len(row) > n_cols:
+            fixed_rows.append(row[:n_cols])   # truncate extra trailing fields
+        elif len(row) < n_cols:
+            fixed_rows.append(row + [""] * (n_cols - len(row)))  # pad short rows
+        else:
+            fixed_rows.append(row)
+
+    df = pd.DataFrame(fixed_rows, columns=header).fillna("")
+
+    # Normalize column names: lowercase, strip whitespace, spaces → underscores
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Strip output columns from previous optimizer runs
+    df = df.drop(columns=[c for c in df.columns if c in _PREV_OUTPUT_COLS], errors="ignore")
+
+    return df
+
+
+def get_group_id(row: "pd.Series") -> str:
+    """
+    Return the base product ID used for grouping variants.
+    Prefers item_group_id (Shopify/MC export format) over base-ID stripping.
+    """
+    group_id = str(row.get("item_group_id", "")).strip()
+    if group_id and group_id not in ("", "nan"):
+        return group_id
+    return get_base_id(str(row.get("id", "")))
+
+
+# ---------------------------------------------------------------------------
 # URL map
 # ---------------------------------------------------------------------------
 
 def build_url_map(df: pd.DataFrame) -> dict[str, str]:
     """
-    Build {base_id: url} — one URL per unique base product.
-    Uses the first row encountered for each base_id (typically the single/base variant).
+    Build {group_id: url} — one URL per unique base product.
+    Uses the first row encountered for each group_id (typically the single/base variant).
     """
     url_map: dict[str, str] = {}
     for _, row in df.iterrows():
-        base_id = get_base_id(str(row["id"]))
-        if base_id not in url_map:
+        gid = get_group_id(row)
+        if gid not in url_map:
             url = str(row.get("link", "")).strip()
             if url.startswith("http"):
-                url_map[base_id] = url
+                url_map[gid] = url
     return url_map
 
 
@@ -283,16 +351,26 @@ def _build_candidates(brief: str) -> tuple[list[str], list[str]]:
     """
     Extract symptom and ingredient candidate phrases from a structured brief.
     Returns (symptom_candidates, ingredient_candidates).
+
+    For supplements: SYMPTOMS + REVIEWS → symptom candidates, INGREDIENTS → ingredient candidates.
+    For apparel / non-supplement products: CLAIMS doubles as symptom candidates (search desires),
+    PRODUCT_FORM is used as an ingredient candidate (product type keyword).
     """
     symptoms = _parse_brief_section(brief, "SYMPTOMS")
     reviews  = _parse_brief_section(brief, "REVIEWS")
+    claims   = _parse_brief_section(brief, "CLAIMS")   # apparel: benefit/desire phrases
+
     symptom_candidates = list(dict.fromkeys(
-        _trim_phrase(s.lower().strip()) for s in symptoms + reviews if len(s.strip()) > 5
+        _trim_phrase(s.lower().strip())
+        for s in symptoms + reviews + claims
+        if len(s.strip()) > 5
     ))[:10]
 
     raw_ingredients = _parse_brief_section(brief, "INGREDIENTS")
+    product_form    = _parse_brief_section(brief, "PRODUCT_FORM")  # apparel: fabric/form keyword
+
     ingredient_candidates = list(dict.fromkeys(
-        i.lower().strip() for i in raw_ingredients if len(i.strip()) > 3
+        i.lower().strip() for i in raw_ingredients + product_form if len(i.strip()) > 3
     ))[:8]
 
     return symptom_candidates, ingredient_candidates
@@ -302,14 +380,21 @@ def _call_planner_script(keywords: list[str], language: str, location: str) -> l
     """Call keyword_planner.py as a subprocess and return parsed JSON results."""
     script = Path(__file__).parent / "scripts" / "keyword_planner.py"
     if not script.exists():
+        print("  [keyword_planner] ERROR: script not found at", script, file=sys.stderr)
         return []
     cmd = [sys.executable, str(script), "--keywords", *keywords, "--language", language, "--location", location]
     try:
-        result = subprocess.run(cmd, capture_output=True, cwd=Path(__file__).parent, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, cwd=Path(__file__).parent, timeout=120)
         if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            print(f"  [keyword_planner] FAILED (exit {result.returncode}): {stderr}", file=sys.stderr)
             return []
         return json.loads(result.stdout.decode("utf-8"))
-    except Exception:
+    except subprocess.TimeoutExpired:
+        print("  [keyword_planner] TIMEOUT after 120s", file=sys.stderr)
+        return []
+    except Exception as exc:
+        print(f"  [keyword_planner] EXCEPTION: {exc}", file=sys.stderr)
         return []
 
 
@@ -415,12 +500,12 @@ def enrich_dataframe(
 ) -> pd.DataFrame:
     """Add product_page_brief (and optionally keyword_angles) columns, shared across variants."""
     enriched = df.copy()
-    enriched[BRIEF_COL] = enriched["id"].apply(
-        lambda pid: briefs.get(get_base_id(str(pid)), "")
+    enriched[BRIEF_COL] = enriched.apply(
+        lambda row: briefs.get(get_group_id(row), ""), axis=1
     )
     if angles is not None:
-        enriched[KEYWORD_ANGLES_COL] = enriched["id"].apply(
-            lambda pid: angles.get(get_base_id(str(pid)), "")
+        enriched[KEYWORD_ANGLES_COL] = enriched.apply(
+            lambda row: angles.get(get_group_id(row), ""), axis=1
         )
     return enriched
 
@@ -445,7 +530,7 @@ def call_claude(
     columns: list[str] | None = None,
     extra_context: str = "",
 ) -> str:
-    # Build column scope instruction
+    # Determine which output columns Claude should generate
     all_output_cols = [
         "optimized_title",
         "optimized_description",
@@ -460,12 +545,14 @@ def call_claude(
         active = [c for c in all_output_cols if c in columns]
         skipped = [c for c in all_output_cols if c not in columns]
         col_instruction = (
-            f"Generate ONLY these output columns: {', '.join(active)}. "
-            f"For the following columns output an empty string: {', '.join(skipped)}. "
-            "Always generate audit_flags regardless.\n\n"
+            f"Generate ONLY these output columns (plus id and audit_flags): {', '.join(active)}. "
+            f"For the following columns output an empty string: {', '.join(skipped)}.\n\n"
         )
     else:
+        active = all_output_cols
         col_instruction = ""
+
+    output_cols_list = ", ".join(["id"] + active + ["audit_flags"])
 
     user_message = (
         (f"{extra_context}\n\n" if extra_context else "") +
@@ -482,10 +569,11 @@ def call_claude(
         "descriptions — do not substitute synonyms. If this column is empty or says "
         "'keyword_planner_unavailable', fall back to your own judgement and add "
         "`keyword_planner_unavailable` to `audit_flags`.\n\n"
-        f"Do NOT include the `{BRIEF_COL}` or `{KEYWORD_ANGLES_COL}` columns in your output "
-        "CSV — they are working columns only.\n\n"
         + col_instruction +
-        "Return the complete optimized CSV first, then the summary section.\n\n"
+        f"IMPORTANT: Output a compact CSV containing ONLY these columns: {output_cols_list}. "
+        f"Do NOT repeat or re-output any other original columns — the original data will be "
+        f"merged back in Python. Do NOT include the `{BRIEF_COL}` or `{KEYWORD_ANGLES_COL}` columns.\n\n"
+        "Return the compact CSV first, then the summary section.\n\n"
         f"```csv\n{csv_text}\n```"
     )
 
@@ -709,6 +797,81 @@ def extract_csv_and_summary(response: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Output merging — join Claude's compact output back into the original df
+# ---------------------------------------------------------------------------
+
+OUTPUT_COLS = [
+    "optimized_title",
+    "optimized_description",
+    "product_type_suggested",
+    "custom_label_0",
+    "custom_label_1",
+    "custom_label_2",
+    "custom_label_3",
+    "custom_label_4",
+    "audit_flags",
+]
+
+
+def merge_claude_output(original_df: pd.DataFrame, claude_csv: str) -> pd.DataFrame:
+    """
+    Parse Claude's compact CSV (id + output cols only) and left-join it back
+    onto the original DataFrame. Original columns are never modified.
+    Returns a DataFrame with original columns + new output columns appended.
+    """
+    # Use csv.reader for robust parsing — handles quoted commas, normalises row lengths
+    try:
+        reader = csv.reader(io.StringIO(claude_csv))
+        raw_rows = list(reader)
+    except Exception as e:
+        print(f"  WARNING: Could not parse Claude output CSV: {e}")
+        return original_df
+
+    if not raw_rows:
+        print("  WARNING: Claude output CSV is empty — cannot merge.")
+        return original_df
+
+    raw_header = [c.strip().lower().replace(" ", "_") for c in raw_rows[0]]
+    n_cols = len(raw_header)
+
+    if "id" not in raw_header:
+        print("  WARNING: Claude output has no 'id' column — cannot merge.")
+        return original_df
+
+    fixed_data = []
+    for row in raw_rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue  # skip blank rows
+        if len(row) > n_cols:
+            fixed_data.append(row[:n_cols])   # truncate extra fields
+        elif len(row) < n_cols:
+            fixed_data.append(row + [""] * (n_cols - len(row)))  # pad short rows
+        else:
+            fixed_data.append(row)
+
+    claude_df = pd.DataFrame(fixed_data, columns=raw_header).fillna("")
+
+    # Keep only id + known output columns that Claude actually produced
+    keep = ["id"] + [c for c in OUTPUT_COLS if c in claude_df.columns]
+    claude_df = claude_df[keep].drop_duplicates(subset=["id"])
+
+    result = original_df.copy()
+    # Drop any stale output cols from a previous run on the original df
+    result = result.drop(columns=[c for c in OUTPUT_COLS if c in result.columns], errors="ignore")
+
+    result = result.merge(claude_df, on="id", how="left")
+
+    # Fill any rows Claude missed with empty strings
+    for col in OUTPUT_COLS:
+        if col not in result.columns:
+            result[col] = ""
+        else:
+            result[col] = result[col].fillna("")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
@@ -802,9 +965,9 @@ Examples:
         sys.exit(1)
 
     print(f"\nReading: {input_path}")
-    df = pd.read_csv(input_path, dtype=str).fillna("")
+    df = read_feed_csv(input_path)
 
-    unique_products = df["id"].apply(get_base_id).nunique()
+    unique_products = df.apply(get_group_id, axis=1).nunique()
     print(f"  {len(df)} rows | {unique_products} unique products")
 
     # ── Determine output path ──────────────────────────────────────────────
@@ -837,9 +1000,9 @@ Examples:
                 if args.location:
                     location = args.location
                 variants_map: dict[str, list[str]] = {}
-                for pid in df["id"].astype(str):
-                    base = get_base_id(pid)
-                    variants_map.setdefault(base, []).append(pid)
+                for _, row in df.iterrows():
+                    gid = get_group_id(row)
+                    variants_map.setdefault(gid, []).append(str(row["id"]))
                 angles = build_keyword_angles(briefs, variants_map, language, location, verbose=True)
 
             enriched_df = enrich_dataframe(df, briefs, angles if angles else None)
@@ -891,9 +1054,9 @@ Examples:
             )
             retry_csv, _ = extract_csv_and_summary(retry_response)
             if retry_csv and "optimized_title" in retry_csv:
-                # Merge: strip header from retry and append to main output
+                # Merge retry rows into the main compact csv
                 retry_lines = retry_csv.splitlines()
-                retry_data = "\n".join(retry_lines[1:])  # drop header row
+                retry_data = "\n".join(retry_lines[1:])  # drop header
                 csv_output = csv_output.rstrip() + "\n" + retry_data
                 print(f"  Retry succeeded — appended {len(retry_lines)-1} rows")
             else:
@@ -901,8 +1064,21 @@ Examples:
         except Exception as e:
             print(f"  Retry failed: {e}")
 
+    # ── Merge Claude output back into original DataFrame ───────────────────
+    result_df = merge_claude_output(df, csv_output)
+
+    # ── Append brand to optimized_title if present ─────────────────────────
+    if "brand" in result_df.columns and "optimized_title" in result_df.columns:
+        def _append_brand(row: pd.Series) -> str:
+            title = str(row["optimized_title"]).strip()
+            brand = str(row["brand"]).strip()
+            if not title or not brand or brand.lower() in title.lower():
+                return title
+            return f"{title} | {brand}"
+        result_df["optimized_title"] = result_df.apply(_append_brand, axis=1)
+
     # ── Write output ───────────────────────────────────────────────────────
-    output_path.write_text(csv_output, encoding="utf-8")
+    result_df.to_csv(output_path, index=False, encoding="utf-8")
     print(f"\nOutput written: {output_path}")
 
     if summary:
